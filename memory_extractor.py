@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """SessionEnd hook: distill a finished session's transcript into the Obsidian
 memory vault via a headless `claude -p` call (uses existing subscription auth,
-no ANTHROPIC_API_KEY needed)."""
+no ANTHROPIC_API_KEY needed).
+
+SessionEnd hooks get roughly a 1.5s execution budget from Claude Code (raising
+a hook's own `timeout` only lifts this to a 60s hard cap), but the `claude -p`
+extraction call below routinely takes longer than that. So `main()` only does
+the cheap part synchronously (parse the transcript, decide whether it's worth
+extracting) and hands the LLM call + note-writing off to a fully detached
+background process via `--extract`, so the hook itself returns almost
+immediately instead of being cancelled before it can do anything.
+"""
 import json
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -14,7 +24,7 @@ CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 LOG_PATH = VAULT_PATH / ".extractor.log"
 
 
-def log_error(msg: str) -> None:
+def log(msg: str) -> None:
     VAULT_PATH.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
@@ -88,31 +98,9 @@ def update_index() -> None:
     (VAULT_PATH / "Index.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def main() -> None:
-    try:
-        hook_input = json.loads(sys.stdin.read())
-    except json.JSONDecodeError:
-        return
-
-    session_id = hook_input.get("session_id", "")
-    project_dir = hook_input.get("cwd", "")
-    if not session_id:
-        return
-
-    transcript_path = hook_input.get("transcript_path")
-    transcript_file = Path(transcript_path) if transcript_path else None
-    if not transcript_file or not transcript_file.is_file():
-        transcript_file = find_session_transcript(session_id)
-    if not transcript_file:
-        log_error(f"session {session_id}: no transcript file found")
-        return
-
-    raw_transcript = transcript_file.read_text(encoding="utf-8")
-    transcript_text = parse_transcript(raw_transcript)
-    if len(transcript_text) < 200:
-        return  # too little signal to be worth an extraction call
-
-    project_name = Path(project_dir).name or "unknown"
+def extract_and_write(session_id: str, project_name: str, transcript_text: str) -> None:
+    """Runs in the detached background process. Does the slow LLM call and
+    writes the resulting notes into the vault."""
     prompt = f"""You are analyzing a Claude Code session transcript to extract durable, reusable knowledge for a cross-session memory vault. Project: {project_name}.
 
 TRANSCRIPT:
@@ -132,67 +120,77 @@ Only include items that are genuinely reusable or important for future sessions 
 
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "json", "--model", "haiku", "--allowedTools", ""],
+            # disableAllHooks is required here: this call is itself a Claude Code
+            # session, so without it, SessionEnd would fire again when it exits and
+            # recursively re-invoke this same extraction hook on its own transcript.
+            ["claude", "-p", prompt, "--output-format", "json", "--model", "haiku",
+             "--allowedTools", "", "--settings", '{"disableAllHooks": true}'],
             capture_output=True,
             text=True,
             timeout=180,
         )
     except (subprocess.SubprocessError, FileNotFoundError) as e:
-        log_error(f"session {session_id}: subprocess failed: {e}")
+        log(f"session {session_id}: subprocess failed: {e}")
         return
 
     if result.returncode != 0:
-        log_error(f"session {session_id}: claude -p exited {result.returncode}: {result.stderr[:500]}")
+        log(f"session {session_id}: claude -p exited {result.returncode}: {result.stderr[:500]}")
         return
 
     try:
         envelope = json.loads(result.stdout)
     except json.JSONDecodeError as e:
-        log_error(f"session {session_id}: bad envelope JSON: {e}: {result.stdout[:500]}")
+        log(f"session {session_id}: bad envelope JSON: {e}: {result.stdout[:500]}")
         return
 
     if envelope.get("is_error"):
-        log_error(f"session {session_id}: claude -p reported is_error: {envelope}")
+        log(f"session {session_id}: claude -p reported is_error: {envelope}")
         return
 
     insights_raw = re.sub(r"```(?:json)?\n?", "", envelope.get("result", "")).strip()
     try:
         insights, _ = json.JSONDecoder().raw_decode(insights_raw)
     except json.JSONDecodeError as e:
-        log_error(f"session {session_id}: bad insights JSON: {e}: {insights_raw[:500]}")
+        log(f"session {session_id}: bad insights JSON: {e}: {insights_raw[:500]}")
         return
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     time_str = datetime.now().strftime("%H%M")
     session_short = session_id[:8]
+    note_count = 0
 
     if insights.get("context"):
         for item in insights["context"]:
             write_note("Context", date_str, session_short, project_name, item["title"],
                        f"## {item['title']}\n\n{item['detail']}", item.get("tags", []) + ["context"])
+            note_count += 1
 
     if insights.get("plans"):
         for item in insights["plans"]:
             write_note("Plans", date_str, session_short, project_name, item["title"],
                        f"## {item['title']}\n\n{item['detail']}", item.get("tags", []) + ["plan"])
+            note_count += 1
 
     if insights.get("decisions"):
         for item in insights["decisions"]:
             write_note("Decisions", date_str, session_short, project_name, item["title"],
                        f"## {item['title']}\n\n**Decision:** {item['decision']}\n\n**Reasoning:** {item['reasoning']}",
                        item.get("tags", []) + ["decision"])
+            note_count += 1
 
     if insights.get("mistakes"):
         for item in insights["mistakes"]:
             write_note("Mistakes", date_str, session_short, project_name, item["title"],
                        f"## {item['title']}\n\n**Error:** {item['error']}\n\n**Fix:** {item['fix']}",
                        item.get("tags", []) + ["mistake"])
+            note_count += 1
 
     if insights.get("dos_donts"):
         for item in insights["dos_donts"]:
             write_note("DosDonts", date_str, session_short, project_name, item["title"],
                        f"## {item['title']}\n\n**Rule:** {item['rule']}\n\n**Why:** {item['why']}",
                        item.get("tags", []) + ["dos-donts"])
+            note_count += 1
 
     sessions_dir = VAULT_PATH / "Sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -203,6 +201,64 @@ Only include items that are genuinely reusable or important for future sessions 
     )
 
     update_index()
+    log(f"session {session_id}: wrote {note_count} note(s) + session summary")
+
+
+def run_extract_mode(payload_path_arg: str) -> None:
+    payload_path = Path(payload_path_arg)
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        extract_and_write(payload["session_id"], payload["project_name"], payload["transcript_text"])
+    finally:
+        payload_path.unlink(missing_ok=True)
+
+
+def main() -> None:
+    if len(sys.argv) > 2 and sys.argv[1] == "--extract":
+        run_extract_mode(sys.argv[2])
+        return
+
+    try:
+        hook_input = json.loads(sys.stdin.read())
+    except json.JSONDecodeError:
+        return
+
+    session_id = hook_input.get("session_id", "")
+    project_dir = hook_input.get("cwd", "")
+    if not session_id:
+        return
+
+    transcript_path = hook_input.get("transcript_path")
+    transcript_file = Path(transcript_path) if transcript_path else None
+    if not transcript_file or not transcript_file.is_file():
+        transcript_file = find_session_transcript(session_id)
+    if not transcript_file:
+        # Routine for subagent/sidechain sessions: their turns live inline in
+        # the parent session's transcript, not in a standalone file. Not an
+        # error, so not worth logging.
+        return
+
+    raw_transcript = transcript_file.read_text(encoding="utf-8")
+    transcript_text = parse_transcript(raw_transcript)
+    if len(transcript_text) < 200:
+        return  # too little signal to be worth an extraction call
+
+    project_name = Path(project_dir).name or "unknown"
+
+    payload = {"session_id": session_id, "project_name": project_name, "transcript_text": transcript_text}
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(payload, f)
+            payload_path = f.name
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--extract", payload_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        log(f"session {session_id}: failed to spawn background extractor: {e}")
 
 
 if __name__ == "__main__":
