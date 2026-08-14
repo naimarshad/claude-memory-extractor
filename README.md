@@ -60,7 +60,15 @@ python3 ~/.claude/hooks/memory_extractor.py --reindex <vault-path>   # rebuild I
 
 `/memory-recall <what to look for>` searches the vault scoped to the current project (falling back to the whole vault if nothing turns up), reads the matching notes in full, and answers from them — see `skills/memory-recall/SKILL.md`. Claude also auto-invokes it when it senses a question needs prior-session history, without the slash command. This is grep-based, not semantic search — good enough at the vault's current size, but it won't find conceptually-related notes that don't share a keyword.
 
-## Where this runs
+## Running it on more than one machine
 
-- **This machine (naeem, host):** installed manually into `~/.claude/`.
-- **`personal-claude-env`** (the always-on dev-container agent, see `compose-files/dev-container/`): `entrypoint.sh` runs this installer as the `node` user on every container start, since that container's `$HOME` is a fresh/persisted volume rather than a checkout of this repo's dotfiles. Its `~/Obsidian` is bind-mounted separately from this repo's — see that directory's `CLAUDE.md` for the exact mount and how it relates to this vault.
+Install per machine. The routing config is local to each machine, so where a session's notes land is a local decision rather than something this repo dictates. Point every machine's vault directory at the same underlying storage (a synced folder, a network mount) and the notes converge, keyed by the `project:` frontmatter field rather than by machine.
+
+Two configurations worth knowing:
+
+- **One machine, several vaults.** Set `default_vault` to the everyday vault and add a `routes` entry for the directory tree that belongs somewhere else, such as a work checkout on a personal machine.
+- **A machine that is only one kind of work.** Point `default_vault` at that machine's vault and leave `routes` empty. A session started outside the directory you expected then still cannot file notes into the wrong vault, which is the failure a routes-only setup allows.
+
+The extraction call uses whichever `claude` is authenticated on that machine, so machines on separate accounts or subscriptions need nothing shared between them beyond the vault itself.
+
+In a container or anywhere `$HOME` is rebuilt, run `install.sh` from the start-up script. It is idempotent, and it will not overwrite an existing config.
