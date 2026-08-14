@@ -9,6 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="${HOME}/.claude"
 HOOKS_DIR="${CLAUDE_DIR}/hooks"
+SKILLS_DIR="${CLAUDE_DIR}/skills"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 GLOBAL_MD="${CLAUDE_DIR}/CLAUDE.md"
 MARKER="<!-- claude-memory-extractor: vault-check -->"
@@ -18,6 +19,9 @@ command -v python3 >/dev/null || { echo "install.sh: python3 not found in PATH" 
 
 mkdir -p "$HOOKS_DIR"
 ln -sf "${SCRIPT_DIR}/memory_extractor.py" "${HOOKS_DIR}/memory_extractor.py"
+
+mkdir -p "$SKILLS_DIR"
+ln -sfn "${SCRIPT_DIR}/skills/memory-recall" "${SKILLS_DIR}/memory-recall"
 
 [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
 if ! jq -e '.hooks.SessionEnd' "$SETTINGS_FILE" >/dev/null 2>&1; then
