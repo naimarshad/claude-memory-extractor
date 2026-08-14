@@ -10,8 +10,14 @@ the cheap part synchronously (parse the transcript, decide whether it's worth
 extracting) and hands the LLM call + note-writing off to a fully detached
 background process via `--extract`, so the hook itself returns almost
 immediately instead of being cancelled before it can do anything.
+
+Which vault a session lands in is resolved per session from the directory it ran
+in, so one install can feed several vaults (e.g. a personal one and a work one)
+without mixing them. See `resolve_vault()` for the precedence and
+`config.example.json` for the config file this reads.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -19,15 +25,76 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-VAULT_PATH = Path.home() / "Obsidian" / "Claude" / "claude-memory"
+CONFIG_PATH = Path.home() / ".claude" / "memory-extractor.json"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-LOG_PATH = VAULT_PATH / ".extractor.log"
+FALLBACK_VAULT = Path.home() / "Obsidian" / "Claude" / "claude-memory"
+DEFAULT_MODEL = "haiku"
+
+# Rebound once per run from the resolved config, before any note is written.
+# Module-level rather than threaded through every call because the write helpers
+# below all target one vault for the lifetime of a single extraction.
+VAULT_PATH = FALLBACK_VAULT
 
 
 def log(msg: str) -> None:
     VAULT_PATH.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("a", encoding="utf-8") as f:
+    with (VAULT_PATH / ".extractor.log").open("a", encoding="utf-8") as f:
         f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
+
+
+def load_config() -> dict:
+    """Missing or malformed config is not fatal: the defaults below still give a
+    working single-vault install, which is what a fresh clone should do."""
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"config at {CONFIG_PATH} unreadable ({e}); falling back to defaults")
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def resolve_vault(cwd: str, config: dict) -> Path:
+    """Vault for a session that ran in `cwd`, most specific match first:
+    the CLAUDE_MEMORY_VAULT env var, then the longest matching `routes` prefix,
+    then `default_vault`. Longest-match so a route can carve an exception out of
+    a broader route without ordering mattering."""
+    override = os.environ.get("CLAUDE_MEMORY_VAULT")
+    if override:
+        return Path(override).expanduser()
+
+    best_prefix, best_vault = None, None
+    if cwd:
+        cwd_path = Path(cwd).expanduser().resolve()
+        for route in config.get("routes", []):
+            if not isinstance(route, dict) or not route.get("prefix") or not route.get("vault"):
+                continue
+            prefix = Path(route["prefix"]).expanduser().resolve()
+            if cwd_path != prefix and not cwd_path.is_relative_to(prefix):
+                continue
+            if best_prefix is None or len(prefix.parts) > len(best_prefix.parts):
+                best_prefix, best_vault = prefix, Path(route["vault"]).expanduser()
+    if best_vault:
+        return best_vault
+
+    return Path(config.get("default_vault", str(FALLBACK_VAULT))).expanduser()
+
+
+def resolve_project_name(cwd: str) -> str:
+    """Repo root name, not the leaf directory name: a session that ran in a
+    subdirectory belongs to the same project as one that ran at the root, and
+    without this every `cd` into a subdirectory invents a new project."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).name
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return Path(cwd).name or "unknown"
 
 
 def find_session_transcript(session_id: str) -> Path | None:
@@ -145,7 +212,7 @@ def update_index() -> None:
     (VAULT_PATH / "Index.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def extract_and_write(session_id: str, project_name: str, transcript_text: str) -> None:
+def extract_and_write(session_id: str, project_name: str, transcript_text: str, model: str) -> None:
     """Runs in the detached background process. Does the slow LLM call and
     writes the resulting notes into the vault."""
     existing_titles, existing_tags = collect_project_memory(project_name)
@@ -185,7 +252,7 @@ Only include items that are genuinely reusable or important for future sessions 
             # disableAllHooks is required here: this call is itself a Claude Code
             # session, so without it, SessionEnd would fire again when it exits and
             # recursively re-invoke this same extraction hook on its own transcript.
-            ["claude", "-p", prompt, "--output-format", "json", "--model", "haiku",
+            ["claude", "-p", prompt, "--output-format", "json", "--model", model,
              "--allowedTools", "", "--settings", '{"disableAllHooks": true}'],
             capture_output=True,
             text=True,
@@ -275,17 +342,40 @@ Only include items that are genuinely reusable or important for future sessions 
 
 
 def run_extract_mode(payload_path_arg: str) -> None:
+    global VAULT_PATH
     payload_path = Path(payload_path_arg)
     try:
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
-        extract_and_write(payload["session_id"], payload["project_name"], payload["transcript_text"])
+        # Resolved by the parent hook process, not re-resolved here: the cwd is
+        # gone by now, and both halves must agree on one vault.
+        VAULT_PATH = Path(payload["vault"])
+        extract_and_write(payload["session_id"], payload["project_name"],
+                          payload["transcript_text"], payload.get("model", DEFAULT_MODEL))
     finally:
         payload_path.unlink(missing_ok=True)
 
 
 def main() -> None:
+    global VAULT_PATH
+
     if len(sys.argv) > 2 and sys.argv[1] == "--extract":
         run_extract_mode(sys.argv[2])
+        return
+
+    # Used by the memory-recall skill so vault routing has exactly one
+    # implementation instead of being restated in the skill's grep paths.
+    if len(sys.argv) > 1 and sys.argv[1] == "--resolve-vault":
+        cwd = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
+        print(resolve_vault(cwd, load_config()))
+        return
+
+    # Index.md is otherwise only rewritten as a side effect of an extraction, so
+    # this is how you repair it after moving notes between vaults by hand.
+    if len(sys.argv) > 1 and sys.argv[1] == "--reindex":
+        VAULT_PATH = (Path(sys.argv[2]).expanduser() if len(sys.argv) > 2
+                      else resolve_vault(os.getcwd(), load_config()))
+        update_index()
+        print(f"reindexed {VAULT_PATH}")
         return
 
     try:
@@ -297,6 +387,9 @@ def main() -> None:
     project_dir = hook_input.get("cwd", "")
     if not session_id:
         return
+
+    config = load_config()
+    VAULT_PATH = resolve_vault(project_dir, config)
 
     transcript_path = hook_input.get("transcript_path")
     transcript_file = Path(transcript_path) if transcript_path else None
@@ -313,9 +406,13 @@ def main() -> None:
     if len(transcript_text) < 200:
         return  # too little signal to be worth an extraction call
 
-    project_name = Path(project_dir).name or "unknown"
-
-    payload = {"session_id": session_id, "project_name": project_name, "transcript_text": transcript_text}
+    payload = {
+        "session_id": session_id,
+        "project_name": resolve_project_name(project_dir),
+        "transcript_text": transcript_text,
+        "vault": str(VAULT_PATH),
+        "model": config.get("model", DEFAULT_MODEL),
+    }
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
             json.dump(payload, f)

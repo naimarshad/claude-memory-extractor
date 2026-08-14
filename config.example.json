@@ -1,0 +1,7 @@
+{
+  "default_vault": "~/Obsidian/Claude/claude-memory",
+  "routes": [
+    { "prefix": "~/path/to/work/repos", "vault": "~/Obsidian/Work/claude-memory" }
+  ],
+  "model": "haiku"
+}
