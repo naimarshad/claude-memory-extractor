@@ -18,6 +18,6 @@ To answer the query above:
 2. Search for candidate notes, scoped to that project first, e.g.:
    `grep -rl "project: $PROJECT" "$VAULT"/{Context,Plans,Decisions,Mistakes,DosDonts,Incidents,Sessions} 2>/dev/null`
    then narrow with a case-insensitive keyword grep over those files for terms from the query. If nothing turns up under the current project, broaden to the whole vault, but stay inside `$VAULT`: other vaults on this machine are deliberately separate and must not be searched.
-3. Read the full content of the notes that actually match (`cat` or the Read tool), not just filenames — frontmatter and headers alone are rarely enough context.
+3. Read the full content of the notes that actually match (`cat` or the Read tool), not just filenames, since frontmatter and headers alone are rarely enough context.
 4. If grep is inconclusive, fall back to skimming `"$VAULT"/Index.md` for likely titles.
-5. Answer using only what the notes actually say. If nothing relevant is found, say so plainly rather than guessing — do not invent history that isn't in the vault.
+5. Answer using only what the notes actually say. If nothing relevant is found, say so plainly rather than guessing. Do not invent history that isn't in the vault.

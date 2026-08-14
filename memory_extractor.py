@@ -223,7 +223,7 @@ def extract_and_write(session_id: str, project_name: str, transcript_text: str, 
 
     prompt = f"""You are analyzing a Claude Code session transcript to extract durable, reusable knowledge for a cross-session memory vault. Project: {project_name}.
 
-ALREADY IN THE VAULT FOR THIS PROJECT (most recent first, do not re-extract these — only include an item if it is new information, or a material update/correction/reversal of one of these, in which case say so explicitly in the detail so it reads as an update, not a duplicate):
+ALREADY IN THE VAULT FOR THIS PROJECT (most recent first, do not re-extract these. Only include an item if it is new information, or a material update/correction/reversal of one of these, in which case say so explicitly in the detail so it reads as an update, not a duplicate):
 {existing_titles_block}
 
 TAGS ALREADY USED FOR THIS PROJECT (reuse these instead of inventing a new spelling or variant of the same concept, e.g. don't add "k0s_prod" if "k0s-prod" is already here; still add a new tag if none of these fit):
@@ -243,7 +243,7 @@ Extract structured insights in this exact JSON format (no markdown fences, valid
   "session_summary": "2-3 sentence summary of what this session accomplished"
 }}
 
-"mistakes" is for a reusable rule ("don't do X again"). "incidents" is for a dated postmortem of something that actually broke in a running system (an outage, a bad deploy, data loss) — only use it for real breakage, not routine bugs caught during development.
+"mistakes" is for a reusable rule ("don't do X again"). "incidents" is for a dated postmortem of something that actually broke in a running system (an outage, a bad deploy, data loss). Only use it for real breakage, not routine bugs caught during development.
 
 Only include items that are genuinely reusable or important for future sessions on this project. Omit a category entirely (empty list) if nothing qualifies. Do not invent information not present in the transcript."""
 
