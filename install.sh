@@ -2,8 +2,8 @@
 # Idempotently wires up the SessionEnd memory-extraction hook for the current
 # user's Claude Code config. Safe to re-run on every container start or shell
 # login: symlinks the hook, merges the SessionEnd registration into
-# settings.json without touching other keys, and appends the vault-check
-# pointer to the global CLAUDE.md exactly once.
+# settings.json without touching other keys, refreshes the vault-check pointer
+# in the global CLAUDE.md, and seeds a routing config only if none exists yet.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
