@@ -71,15 +71,62 @@ def safe_title(title: str) -> str:
     return re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "-")[:80] or "untitled"
 
 
+def normalize_tag(tag: str) -> str:
+    """lowercase-hyphenated, so 'k0s-prod', 'k0s_prod', 'K0S Prod' all collapse
+    to the same tag instead of fragmenting grep-based recall across variants."""
+    tag = re.sub(r"[\s_]+", "-", tag.strip().lower())
+    tag = re.sub(r"[^a-z0-9-]", "", tag)
+    return tag.strip("-")
+
+
 def write_note(folder: str, date_str: str, session_short: str, project: str, title: str, content: str, tags: list) -> None:
     folder_path = VAULT_PATH / folder
     folder_path.mkdir(parents=True, exist_ok=True)
     filepath = folder_path / f"{date_str}-{session_short}-{safe_title(title)}.md"
+    tags = sorted({t for t in (normalize_tag(t) for t in tags) if t})
     tag_str = " ".join(f"#{t}" for t in tags) if tags else ""
     frontmatter = (
         f"---\ndate: {date_str}\nproject: {project}\nsession: {session_short}\ntags: [{', '.join(tags)}]\n---\n\n"
     )
     filepath.write_text(frontmatter + content + (f"\n\n{tag_str}" if tag_str else ""), encoding="utf-8")
+
+
+def collect_project_memory(project_name: str, max_titles: int = 60, max_tags: int = 40) -> tuple[list, list]:
+    """Existing note titles and tags already recorded for this project, so the
+    extraction prompt can skip re-extracting known facts and reuse existing
+    tags instead of inventing near-duplicate variants."""
+    categories = ["Context", "Plans", "Decisions", "Mistakes", "DosDonts", "Incidents"]
+    entries = []
+    tag_counts: dict[str, int] = {}
+    for category in categories:
+        folder = VAULT_PATH / category
+        if not folder.is_dir():
+            continue
+        for f in folder.glob("*.md"):
+            try:
+                text = f.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fm_match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+            if not fm_match:
+                continue
+            frontmatter = fm_match.group(1)
+            proj_match = re.search(r"^project:\s*(.+)$", frontmatter, re.MULTILINE)
+            if not proj_match or proj_match.group(1).strip() != project_name:
+                continue
+            title_match = re.search(r"^## (.+)$", text, re.MULTILINE)
+            title = title_match.group(1).strip() if title_match else f.stem
+            entries.append((f.stat().st_mtime, category, title))
+            tags_match = re.search(r"^tags:\s*\[(.*?)\]", frontmatter, re.MULTILINE)
+            if tags_match:
+                for tag in tags_match.group(1).split(","):
+                    tag = tag.strip()
+                    if tag:
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    entries.sort(key=lambda e: e[0], reverse=True)
+    titles = [f"[{category}] {title}" for _, category, title in entries[:max_titles]]
+    top_tags = sorted(tag_counts, key=lambda t: tag_counts[t], reverse=True)[:max_tags]
+    return titles, top_tags
 
 
 def update_index() -> None:
@@ -101,7 +148,19 @@ def update_index() -> None:
 def extract_and_write(session_id: str, project_name: str, transcript_text: str) -> None:
     """Runs in the detached background process. Does the slow LLM call and
     writes the resulting notes into the vault."""
+    existing_titles, existing_tags = collect_project_memory(project_name)
+    existing_titles_block = (
+        "\n".join(f"- {t}" for t in existing_titles) if existing_titles else "(none yet)"
+    )
+    existing_tags_block = ", ".join(existing_tags) if existing_tags else "(none yet)"
+
     prompt = f"""You are analyzing a Claude Code session transcript to extract durable, reusable knowledge for a cross-session memory vault. Project: {project_name}.
+
+ALREADY IN THE VAULT FOR THIS PROJECT (most recent first, do not re-extract these — only include an item if it is new information, or a material update/correction/reversal of one of these, in which case say so explicitly in the detail so it reads as an update, not a duplicate):
+{existing_titles_block}
+
+TAGS ALREADY USED FOR THIS PROJECT (reuse these instead of inventing a new spelling or variant of the same concept, e.g. don't add "k0s_prod" if "k0s-prod" is already here; still add a new tag if none of these fit):
+{existing_tags_block}
 
 TRANSCRIPT:
 {cap_transcript(transcript_text)}
