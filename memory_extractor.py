@@ -84,7 +84,7 @@ def write_note(folder: str, date_str: str, session_short: str, project: str, tit
 
 def update_index() -> None:
     lines = ["# Claude Memory Index", "", f"_Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_", ""]
-    for folder in ["Context", "Plans", "Decisions", "Mistakes", "DosDonts", "Sessions"]:
+    for folder in ["Context", "Plans", "Decisions", "Mistakes", "DosDonts", "Incidents", "Sessions"]:
         folder_path = VAULT_PATH / folder
         lines.append(f"## {folder}")
         lines.append("")
@@ -113,8 +113,11 @@ Extract structured insights in this exact JSON format (no markdown fences, valid
   "decisions": [{{"title": "short title", "decision": "what was decided", "reasoning": "why", "tags": ["tag1"]}}],
   "mistakes": [{{"title": "short title", "error": "what went wrong", "fix": "how it was resolved or avoided", "tags": ["tag1"]}}],
   "dos_donts": [{{"title": "short title", "rule": "a do or don't rule", "why": "the reason behind it", "tags": ["tag1"]}}],
+  "incidents": [{{"title": "short title", "what_happened": "the outage/breakage and its user-visible impact", "root_cause": "why it happened", "resolution": "how it was fixed and any timeline", "tags": ["tag1"]}}],
   "session_summary": "2-3 sentence summary of what this session accomplished"
 }}
+
+"mistakes" is for a reusable rule ("don't do X again"). "incidents" is for a dated postmortem of something that actually broke in a running system (an outage, a bad deploy, data loss) — only use it for real breakage, not routine bugs caught during development.
 
 Only include items that are genuinely reusable or important for future sessions on this project. Omit a category entirely (empty list) if nothing qualifies. Do not invent information not present in the transcript."""
 
@@ -190,6 +193,14 @@ Only include items that are genuinely reusable or important for future sessions 
             write_note("DosDonts", date_str, session_short, project_name, item["title"],
                        f"## {item['title']}\n\n**Rule:** {item['rule']}\n\n**Why:** {item['why']}",
                        item.get("tags", []) + ["dos-donts"])
+            note_count += 1
+
+    if insights.get("incidents"):
+        for item in insights["incidents"]:
+            write_note("Incidents", date_str, session_short, project_name, item["title"],
+                       f"## {item['title']}\n\n**What happened:** {item['what_happened']}\n\n"
+                       f"**Root cause:** {item['root_cause']}\n\n**Resolution:** {item['resolution']}",
+                       item.get("tags", []) + ["incident"])
             note_count += 1
 
     sessions_dir = VAULT_PATH / "Sessions"
