@@ -3,5 +3,6 @@
   "routes": [
     { "prefix": "~/path/to/work/repos", "vault": "~/Obsidian/Work/claude-memory" }
   ],
+  "machine": "my-laptop",
   "model": "haiku"
 }

@@ -49,14 +49,18 @@ Requires `jq`, `python3`, and `claude` on `PATH`.
 - `default_vault` catches everything no route matches. On a machine where *all* work is one kind (a work laptop, say), point `default_vault` at that vault and leave `routes` empty, so nothing can leak into the wrong vault from a directory you forgot to route.
 - `routes` match on directory prefix and apply to subdirectories too. Longest match wins, so a narrow route can carve an exception out of a broader one regardless of order.
 - `CLAUDE_MEMORY_VAULT` overrides both for a single session.
+- `machine` names this machine in every note's `machine:` frontmatter field. It falls back to the hostname, which is worth setting explicitly on any container, where the hostname is the container ID and changes on every rebuild.
 - Missing or malformed config is not fatal: the built-in defaults still give a working single-vault install.
 
-Two helper modes, both useful when setting a machine up:
+Three helper modes, all useful when setting a machine up:
 
 ```bash
-python3 ~/.claude/hooks/memory_extractor.py --resolve-vault "$PWD"   # which vault would this session use
-python3 ~/.claude/hooks/memory_extractor.py --reindex <vault-path>   # rebuild Index.md after moving notes by hand
+python3 ~/.claude/hooks/memory_extractor.py --resolve-vault "$PWD"      # which vault would this session use
+python3 ~/.claude/hooks/memory_extractor.py --reindex <vault-path>      # rebuild Index.md after moving notes by hand
+python3 ~/.claude/hooks/memory_extractor.py --replay <session-id> [cwd] # re-extract a session, in the foreground
 ```
+
+`--replay` is the way to verify a fresh install without waiting for a session to end, and the way to backfill a session whose extraction failed or was killed. It finds the transcript by session ID under `~/.claude/projects/`, prints the vault, project, and machine it resolved, then runs the extraction and reports the outcome. Unlike the hook, it fails loudly: the hook stays silent when it finds no transcript, because subagent sessions have none and would otherwise fill the log every turn. Transcripts are machine-local, so a session that ran on another machine cannot be replayed here even though its notes are in the shared vault.
 
 ## Recall
 
@@ -65,6 +69,10 @@ python3 ~/.claude/hooks/memory_extractor.py --reindex <vault-path>   # rebuild I
 ## Running it on more than one machine
 
 Install per machine. The routing config is local to each machine, so where a session's notes land is a local decision rather than something this repo dictates. Point every machine's vault directory at the same underlying storage (a synced folder, a network mount) and the notes converge, keyed by the `project:` frontmatter field rather than by machine.
+
+Set `machine` in each machine's config so notes record where they came from. Nothing filters on it, but it is what tells you why a note references a path that does not exist here, and which machine holds the transcript behind a given session ID.
+
+What does *not* converge is transcripts. `~/.claude/projects/` is local to each machine, and its per-project folder names are derived from that machine's own paths, so the same repo appears under different folder names on different machines. None of that reaches the vault: the hook is handed the transcript path directly, and identity comes from the git root's basename, so one repo is one `project:` everywhere it is checked out. The corollary is that a repo cloned under a *different directory name* on another machine becomes a different project.
 
 Two configurations worth knowing:
 

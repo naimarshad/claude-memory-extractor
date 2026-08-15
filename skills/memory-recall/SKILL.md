@@ -6,7 +6,9 @@ argument-hint: <what to look for>
 
 Query: $ARGUMENTS
 
-The vault holds notes distilled from past Claude Code sessions, one Markdown file per item, in `Context/`, `Plans/`, `Decisions/`, `Mistakes/`, `DosDonts/`, `Incidents/`, and `Sessions/`. Every note's frontmatter has a `project:` field set to the repo the session ran in.
+The vault holds notes distilled from past Claude Code sessions, one Markdown file per item, in `Context/`, `Plans/`, `Decisions/`, `Mistakes/`, `DosDonts/`, `Incidents/`, and `Sessions/`. Every note's frontmatter has a `project:` field set to the repo the session ran in, and a `machine:` field naming the machine that ran it.
+
+`project:` is what scopes a search. `machine:` is context, not a filter: several machines write to one vault, and a decision made on one applies to the others unless the note says otherwise. It matters mainly when a note mentions a path, since paths differ per machine, and when you want to explain why a session's transcript is not available locally.
 
 Which vault applies depends on where the session is running: one machine can feed several vaults (for example a personal one and a work one). Never assume a path, always resolve it.
 

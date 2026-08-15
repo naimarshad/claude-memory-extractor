@@ -18,6 +18,7 @@ without mixing them. See `resolve_vault()` for the precedence and
 """
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -32,8 +33,10 @@ DEFAULT_MODEL = "haiku"
 
 # Rebound once per run from the resolved config, before any note is written.
 # Module-level rather than threaded through every call because the write helpers
-# below all target one vault for the lifetime of a single extraction.
+# below all target one vault, and stamp one machine name, for the lifetime of a
+# single extraction.
 VAULT_PATH = FALLBACK_VAULT
+MACHINE_NAME = "unknown"
 
 
 def log(msg: str) -> None:
@@ -79,6 +82,19 @@ def resolve_vault(cwd: str, config: dict) -> Path:
         return best_vault
 
     return Path(config.get("default_vault", str(FALLBACK_VAULT))).expanduser()
+
+
+def resolve_machine(config: dict) -> str:
+    """Name of the machine a session ran on, for the `machine:` frontmatter field.
+
+    Config first, hostname only as a fallback: in a container the hostname is the
+    container ID and changes on every rebuild, which would scatter one machine's
+    notes across a dozen names and make the field useless for exactly the thing
+    it exists for."""
+    name = str(config.get("machine", "")).strip()
+    if name:
+        return name
+    return platform.node() or "unknown"
 
 
 def resolve_project_name(cwd: str) -> str:
@@ -153,7 +169,8 @@ def write_note(folder: str, date_str: str, session_short: str, project: str, tit
     tags = sorted({t for t in (normalize_tag(t) for t in tags) if t})
     tag_str = " ".join(f"#{t}" for t in tags) if tags else ""
     frontmatter = (
-        f"---\ndate: {date_str}\nproject: {project}\nsession: {session_short}\ntags: [{', '.join(tags)}]\n---\n\n"
+        f"---\ndate: {date_str}\nproject: {project}\nsession: {session_short}\n"
+        f"machine: {MACHINE_NAME}\ntags: [{', '.join(tags)}]\n---\n\n"
     )
     filepath.write_text(frontmatter + content + (f"\n\n{tag_str}" if tag_str else ""), encoding="utf-8")
 
@@ -292,6 +309,10 @@ Only include items that are genuinely reusable or important for future sessions 
             capture_output=True,
             text=True,
             timeout=180,
+            # The prompt is an argument, so stdin is never needed, but `claude -p`
+            # waits on an inherited one. Harmless when spawned by the hook (that
+            # process gets DEVNULL anyway), fatal when run in the foreground.
+            stdin=subprocess.DEVNULL,
         )
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         log(f"session {session_id}: subprocess failed: {e}")
@@ -365,8 +386,12 @@ Only include items that are genuinely reusable or important for future sessions 
 
     sessions_dir = VAULT_PATH / "Sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    (sessions_dir / f"{date_str}-{time_str}-{project_name}.md").write_text(
-        f"---\ndate: {date_str}\nproject: {project_name}\nsession: {session_short}\n---\n\n"
+    # session_short is in the filename because date+time+project alone collide:
+    # two extractions for the same project inside the same minute, whether from
+    # one machine or two, silently overwrote each other.
+    (sessions_dir / f"{date_str}-{time_str}-{session_short}-{project_name}.md").write_text(
+        f"---\ndate: {date_str}\nproject: {project_name}\nsession: {session_short}\n"
+        f"machine: {MACHINE_NAME}\n---\n\n"
         f"## Session Summary\n\n{insights.get('session_summary', 'No summary generated.')}\n",
         encoding="utf-8",
     )
@@ -377,12 +402,14 @@ Only include items that are genuinely reusable or important for future sessions 
 
 
 def run_extract_mode(payload_path_arg: str) -> None:
-    global VAULT_PATH
+    global VAULT_PATH, MACHINE_NAME
     payload_path = Path(payload_path_arg)
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     # Resolved by the parent hook process, not re-resolved here: the cwd is
     # gone by now, and both halves must agree on one vault.
     VAULT_PATH = Path(payload["vault"])
+    # Fallback covers payloads parked by a version that did not record it.
+    MACHINE_NAME = payload.get("machine") or resolve_machine(load_config())
     session_id = payload["session_id"]
     try:
         ok = extract_and_write(session_id, payload["project_name"],
@@ -409,12 +436,61 @@ def run_extract_mode(payload_path_arg: str) -> None:
     log(f"session {session_id}: retry with: {sys.executable} {Path(__file__).resolve()} --extract {parked}")
 
 
+def run_replay_mode(session_id: str, cwd: str) -> int:
+    """Re-extract a session by ID, in the foreground, reporting what it did.
+
+    The hook itself is deliberately silent when it cannot find a transcript,
+    because subagent sessions have none and would otherwise fill the log every
+    turn. That silence makes a hand-built payload piped into the hook a bad way
+    to test an install: a typo just produces nothing at all. This path says what
+    it resolved and fails loudly instead."""
+    global VAULT_PATH, MACHINE_NAME
+
+    if not session_id:
+        print("usage: memory_extractor.py --replay <session-id> [cwd]", file=sys.stderr)
+        return 2
+
+    transcript_file = find_session_transcript(session_id)
+    if not transcript_file:
+        print(f"no transcript matching '{session_id}' under {CLAUDE_PROJECTS_DIR}", file=sys.stderr)
+        print("transcripts are machine-local, so a session from another machine cannot be replayed here",
+              file=sys.stderr)
+        return 1
+
+    config = load_config()
+    VAULT_PATH = resolve_vault(cwd, config)
+    MACHINE_NAME = resolve_machine(config)
+    project_name = resolve_project_name(cwd)
+    transcript_text = parse_transcript(transcript_file.read_text(encoding="utf-8"))
+
+    print(f"transcript: {transcript_file}")
+    print(f"project:    {project_name} (from {cwd})")
+    print(f"vault:      {VAULT_PATH}")
+    print(f"machine:    {MACHINE_NAME}")
+    if len(transcript_text) < 200:
+        print(f"warning: only {len(transcript_text)} chars of dialogue; the hook would skip this one")
+    print("extracting, this takes up to 3 minutes...")
+
+    if extract_and_write(transcript_file.stem, project_name, transcript_text,
+                         config.get("model", DEFAULT_MODEL)):
+        print("done, see the log for the note count")
+        return 0
+    print(f"extraction failed, see {VAULT_PATH / '.extractor.log'}", file=sys.stderr)
+    return 1
+
+
 def main() -> None:
     global VAULT_PATH
 
     if len(sys.argv) > 2 and sys.argv[1] == "--extract":
         run_extract_mode(sys.argv[2])
         return
+
+    # Manual re-extraction: for verifying a fresh install, and for backfilling a
+    # session whose extraction failed or was killed before it finished.
+    if len(sys.argv) > 1 and sys.argv[1] == "--replay":
+        sys.exit(run_replay_mode(sys.argv[2] if len(sys.argv) > 2 else "",
+                                 sys.argv[3] if len(sys.argv) > 3 else os.getcwd()))
 
     # Used by the memory-recall skill so vault routing has exactly one
     # implementation instead of being restated in the skill's grep paths.
@@ -465,6 +541,7 @@ def main() -> None:
         "project_name": resolve_project_name(project_dir),
         "transcript_text": transcript_text,
         "vault": str(VAULT_PATH),
+        "machine": resolve_machine(config),
         "model": config.get("model", DEFAULT_MODEL),
     }
     try:
