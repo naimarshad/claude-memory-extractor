@@ -212,9 +212,35 @@ def update_index() -> None:
     (VAULT_PATH / "Index.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def extract_and_write(session_id: str, project_name: str, transcript_text: str, model: str) -> None:
+EXTRACTION_SYSTEM_PROMPT = (
+    "You are a JSON extraction engine. You output exactly one JSON object and nothing "
+    "else: no prose before or after it, no explanation, no markdown fences, no follow-up "
+    "commentary. You never use tools, and you never save, write, or record anything "
+    "anywhere; emitting the JSON is the entire job."
+)
+
+
+def parse_insights(raw: str) -> dict:
+    """The JSON object out of a model reply, tolerating fences and stray prose.
+
+    `raw_decode` from offset 0 only works if the reply is pure JSON, so a single
+    sentence of preamble used to throw the whole extraction away. Try each `{`
+    in turn and take the first one that decodes into an object."""
+    text = re.sub(r"```(?:json)?\n?", "", raw).strip()
+    for start in (m.start() for m in re.finditer(r"\{", text)):
+        try:
+            candidate, _ = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            return candidate
+    raise ValueError("no JSON object found in model output")
+
+
+def extract_and_write(session_id: str, project_name: str, transcript_text: str, model: str) -> bool:
     """Runs in the detached background process. Does the slow LLM call and
-    writes the resulting notes into the vault."""
+    writes the resulting notes into the vault. Returns False if nothing was
+    written, so the caller can keep the payload for a retry."""
     existing_titles, existing_tags = collect_project_memory(project_name)
     existing_titles_block = (
         "\n".join(f"- {t}" for t in existing_titles) if existing_titles else "(none yet)"
@@ -252,36 +278,44 @@ Only include items that are genuinely reusable or important for future sessions 
             # disableAllHooks is required here: this call is itself a Claude Code
             # session, so without it, SessionEnd would fire again when it exits and
             # recursively re-invoke this same extraction hook on its own transcript.
+            #
+            # --system-prompt replaces the default one, which is what keeps this a
+            # single-turn extraction: under the default prompt the call inherits
+            # CLAUDE.md and the auto-memory instructions, starts behaving like an
+            # assistant working on the project, and takes further turns after the
+            # JSON. `--output-format json` only returns the *final* turn, so that
+            # trailing chatter is all that comes back and the JSON is lost.
             ["claude", "-p", prompt, "--output-format", "json", "--model", model,
-             "--allowedTools", "", "--settings", '{"disableAllHooks": true}'],
+             "--allowedTools", "", "--strict-mcp-config", "--disable-slash-commands",
+             "--system-prompt", EXTRACTION_SYSTEM_PROMPT,
+             "--settings", '{"disableAllHooks": true}'],
             capture_output=True,
             text=True,
             timeout=180,
         )
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         log(f"session {session_id}: subprocess failed: {e}")
-        return
+        return False
 
     if result.returncode != 0:
         log(f"session {session_id}: claude -p exited {result.returncode}: {result.stderr[:500]}")
-        return
+        return False
 
     try:
         envelope = json.loads(result.stdout)
     except json.JSONDecodeError as e:
         log(f"session {session_id}: bad envelope JSON: {e}: {result.stdout[:500]}")
-        return
+        return False
 
     if envelope.get("is_error"):
         log(f"session {session_id}: claude -p reported is_error: {envelope}")
-        return
+        return False
 
-    insights_raw = re.sub(r"```(?:json)?\n?", "", envelope.get("result", "")).strip()
     try:
-        insights, _ = json.JSONDecoder().raw_decode(insights_raw)
-    except json.JSONDecodeError as e:
-        log(f"session {session_id}: bad insights JSON: {e}: {insights_raw[:500]}")
-        return
+        insights = parse_insights(envelope.get("result", ""))
+    except ValueError as e:
+        log(f"session {session_id}: {e}: {envelope.get('result', '')[:500]}")
+        return False
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     time_str = datetime.now().strftime("%H%M")
@@ -339,20 +373,40 @@ Only include items that are genuinely reusable or important for future sessions 
 
     update_index()
     log(f"session {session_id}: wrote {note_count} note(s) + session summary")
+    return True
 
 
 def run_extract_mode(payload_path_arg: str) -> None:
     global VAULT_PATH
     payload_path = Path(payload_path_arg)
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    # Resolved by the parent hook process, not re-resolved here: the cwd is
+    # gone by now, and both halves must agree on one vault.
+    VAULT_PATH = Path(payload["vault"])
+    session_id = payload["session_id"]
     try:
-        payload = json.loads(payload_path.read_text(encoding="utf-8"))
-        # Resolved by the parent hook process, not re-resolved here: the cwd is
-        # gone by now, and both halves must agree on one vault.
-        VAULT_PATH = Path(payload["vault"])
-        extract_and_write(payload["session_id"], payload["project_name"],
-                          payload["transcript_text"], payload.get("model", DEFAULT_MODEL))
-    finally:
+        ok = extract_and_write(session_id, payload["project_name"],
+                               payload["transcript_text"], payload.get("model", DEFAULT_MODEL))
+    except Exception as e:  # noqa: BLE001 - a crash here must not eat the payload
+        log(f"session {session_id}: extraction crashed: {type(e).__name__}: {e}")
+        ok = False
+
+    if ok:
         payload_path.unlink(missing_ok=True)
+        return
+
+    # A failed extraction used to delete its own input, so the only way back was
+    # to re-run the whole session. Park the payload instead: the transcript in it
+    # is already parsed and capped, so a retry is one command.
+    failed_dir = VAULT_PATH / ".extractor-failed"
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    parked = failed_dir / f"{session_id}.json"
+    try:
+        payload_path.replace(parked)
+    except OSError:
+        parked.write_text(payload_path.read_text(encoding="utf-8"), encoding="utf-8")
+        payload_path.unlink(missing_ok=True)
+    log(f"session {session_id}: retry with: {sys.executable} {Path(__file__).resolve()} --extract {parked}")
 
 
 def main() -> None:
