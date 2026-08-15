@@ -23,6 +23,14 @@ mkdir -p "$HOOKS_DIR"
 ln -sf "${SCRIPT_DIR}/memory_extractor.py" "${HOOKS_DIR}/memory_extractor.py"
 
 mkdir -p "$SKILLS_DIR"
+# A real directory here, typically an older hand-copied version of the skill,
+# has to go first. `ln -sfn` does not fail on one and does not replace it: it
+# succeeds by creating the link *inside* the directory, so the stale copy stays
+# the skill Claude Code actually loads and the install looks like it worked.
+if [ -e "${SKILLS_DIR}/memory-recall" ] && [ ! -L "${SKILLS_DIR}/memory-recall" ]; then
+  rm -rf "${SKILLS_DIR}/memory-recall"
+  echo "install.sh: replaced a stale copy of ${SKILLS_DIR}/memory-recall with a symlink" >&2
+fi
 ln -sfn "${SCRIPT_DIR}/skills/memory-recall" "${SKILLS_DIR}/memory-recall"
 
 # Copied, never symlinked: vault routing is per-machine, so a `git pull` here
