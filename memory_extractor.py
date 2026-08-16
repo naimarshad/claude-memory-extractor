@@ -319,7 +319,14 @@ Only include items that are genuinely reusable or important for future sessions 
         return False
 
     if result.returncode != 0:
-        log(f"session {session_id}: claude -p exited {result.returncode}: {result.stderr[:500]}")
+        # Log both streams. `claude -p` can fail with an empty stderr and put the
+        # reason on stdout, which logging stderr alone reports as a bare
+        # "exited 1:" with nothing after it, leaving no way to tell an auth
+        # failure from a bad flag from a policy block.
+        detail = f"stderr={result.stderr[:500].strip() or '<empty>'}"
+        if result.stdout.strip():
+            detail += f" stdout={result.stdout[:500].strip()}"
+        log(f"session {session_id}: claude -p exited {result.returncode}: {detail}")
         return False
 
     try:
