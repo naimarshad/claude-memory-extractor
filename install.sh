@@ -41,11 +41,28 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
-if ! jq -e '.hooks.SessionEnd' "$SETTINGS_FILE" >/dev/null 2>&1; then
+# Test for *our own* command, not for the presence of a SessionEnd key. Testing
+# the key means any machine that already uses SessionEnd for something else (a
+# telemetry agent, a task tracker) silently gets no extraction hook: the guard
+# sees the key, assumes the work is done, and says nothing. Appending to the
+# array rather than assigning it is the other half of that: SessionEnd is not
+# ours to own, and several hooks can share it happily.
+if ! jq -e '[(.hooks.SessionEnd // [])[]?.hooks[]?.command // ""]
+            | any(test("memory_extractor\\.py"))' \
+     "$SETTINGS_FILE" >/dev/null 2>&1; then
   tmp="$(mktemp)"
-  jq --slurpfile frag "${SCRIPT_DIR}/hooks.session-end.json" \
-     '.hooks.SessionEnd = $frag[0].SessionEnd' \
-     "$SETTINGS_FILE" > "$tmp" && mv "$tmp" "$SETTINGS_FILE"
+  if jq --slurpfile frag "${SCRIPT_DIR}/hooks.session-end.json" \
+        '.hooks.SessionEnd = ((.hooks.SessionEnd // []) + $frag[0].SessionEnd)' \
+        "$SETTINGS_FILE" > "$tmp"; then
+    mv "$tmp" "$SETTINGS_FILE"
+    echo "install.sh: registered the SessionEnd hook in ${SETTINGS_FILE}" >&2
+  else
+    # Loud and fatal. The old code used `&& mv`, so a jq failure on a malformed
+    # settings file left the hook unregistered with a zero exit status.
+    rm -f "$tmp"
+    echo "install.sh: could not update ${SETTINGS_FILE} (malformed JSON?); the SessionEnd hook is NOT registered" >&2
+    exit 1
+  fi
 fi
 
 touch "$GLOBAL_MD"
