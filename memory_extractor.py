@@ -541,7 +541,14 @@ def main() -> None:
     raw_transcript = transcript_file.read_text(encoding="utf-8")
     transcript_text = parse_transcript(raw_transcript)
     if len(transcript_text) < 200:
-        return  # too little signal to be worth an extraction call
+        # Logged rather than silent so that "no line for this session" means
+        # something went wrong, instead of being ambiguous between a deliberate
+        # skip and a hook that never ran. Subagent sessions, the high-volume
+        # skip, already returned above without a transcript file, so this stays
+        # rare enough not to flood the log.
+        log(f"session {session_id}: skipped, transcript too short "
+            f"({len(transcript_text)} chars, needs 200)")
+        return
 
     payload = {
         "session_id": session_id,
@@ -562,6 +569,12 @@ def main() -> None:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+        # Paired with the "wrote N note(s)" line the background process writes on
+        # success. Without this, a killed extraction (container stop, laptop
+        # suspend, reboot) leaves no trace at all, and its session looks
+        # identical to one the hook never saw. A "starting" with no matching
+        # completion is the signal that the detached process died mid-run.
+        log(f"session {session_id}: starting extraction, model {payload['model']}")
     except OSError as e:
         log(f"session {session_id}: failed to spawn background extractor: {e}")
 
