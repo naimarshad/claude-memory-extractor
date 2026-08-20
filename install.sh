@@ -65,6 +65,36 @@ if ! jq -e '[(.hooks.SessionEnd // [])[]?.hooks[]?.command // ""]
   fi
 fi
 
+# SessionStart hook: a small Go binary that injects the current project's
+# DosDonts notes into a new session's context, so standing rules are present from
+# the first turn instead of depending on the assistant choosing to go and read
+# them. Optional by design, since Go is not on every machine. Registering a hook
+# whose binary does not exist would fail on every single session start, so the
+# registration is deliberately tied to a successful build.
+if command -v go >/dev/null 2>&1; then
+  if (cd "${SCRIPT_DIR}/session-start" && go build -o "${HOOKS_DIR}/session-start" .); then
+    if ! jq -e '[(.hooks.SessionStart // [])[]?.hooks[]?.command // ""]
+                | any(test("hooks/session-start"))' \
+         "$SETTINGS_FILE" >/dev/null 2>&1; then
+      tmp="$(mktemp)"
+      if jq --slurpfile frag "${SCRIPT_DIR}/hooks.session-start.json" \
+            '.hooks.SessionStart = ((.hooks.SessionStart // []) + $frag[0].SessionStart)' \
+            "$SETTINGS_FILE" > "$tmp"; then
+        mv "$tmp" "$SETTINGS_FILE"
+        echo "install.sh: registered the SessionStart hook in ${SETTINGS_FILE}" >&2
+      else
+        rm -f "$tmp"
+        echo "install.sh: could not update ${SETTINGS_FILE}; the SessionStart hook is NOT registered" >&2
+        exit 1
+      fi
+    fi
+  else
+    echo "install.sh: session-start failed to build; the SessionStart hook is NOT registered" >&2
+  fi
+else
+  echo "install.sh: go not found, skipping the optional SessionStart hook (DosDonts injection)" >&2
+fi
+
 touch "$GLOBAL_MD"
 # Rewritten on every run rather than appended once, so edits to the snippet
 # actually reach machines that already installed an older copy. Blocks written
